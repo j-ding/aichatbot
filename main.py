@@ -10,6 +10,8 @@ import app_settings
 import json
 import traceback
 import threading
+import re
+import time
 
 # Initialize global variables
 client = None
@@ -224,8 +226,8 @@ def blink_recording_indicator():
         print(f"Error in blinking indicator: {str(e)}")
 
 def toggle_recording():
-    """Toggle speech recording on/off with simplified error handling"""
-    global is_recording, recognizer, mic_button, user_response_entry, result, recording_indicator_id
+    """Toggle speech recording on/off with improved long-form recording"""
+    global is_recording, recognizer, mic_button, user_response_entry, result, recording_thread
     
     try:
         # Toggle recording state
@@ -239,7 +241,7 @@ def toggle_recording():
             if not recognizer:
                 recognizer = sr.Recognizer()
             
-            # Simple recording indicator - no blinking to reduce complexity
+            # Insert recording start message
             result.insert("end", "\n🔴 Recording... (click mic again to stop)\n")
             result.see("end")
             
@@ -247,13 +249,18 @@ def toggle_recording():
             root.update_idletasks()
             
             # Start recording in a separate thread
-            threading.Thread(target=simplified_recording, daemon=True).start()
+            recording_thread = threading.Thread(target=long_form_recording, daemon=True)
+            recording_thread.start()
         else:
-            # Change button color back to original
+            # Stop recording
+            is_recording = False
             mic_button.configure(fg_color="#2B7DE9")
             
-            # Stop recording is handled by the is_recording flag
-            result.insert("end", "\nStopped recording.\n")
+            # Wait for the recording thread to finish
+            if 'recording_thread' in globals() and recording_thread:
+                recording_thread.join()
+            
+            result.insert("end", "\nStopped recording. Processing audio...\n")
             result.see("end")
             
             # Force UI update
@@ -267,7 +274,98 @@ def toggle_recording():
         is_recording = False
         if mic_button:
             mic_button.configure(fg_color="#2B7DE9")
+
+def long_form_recording():
+    """Record audio continuously for up to 3 minutes or until stopped"""
+    global is_recording, recognizer, user_response_entry, result
+    
+    try:
+        # Use the microphone as source
+        with sr.Microphone() as source:
+            print("Microphone initialized for long-form recording")
             
+            # Adjust for ambient noise
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            print("Ambient noise adjusted")
+            
+            # Collect audio chunks
+            audio_chunks = []
+            
+            # Configure recognizer for long-form recording
+            recognizer.pause_threshold = 0.5
+            recognizer.dynamic_energy_threshold = True
+            recognizer.energy_threshold = 100
+            
+            # Record until stopped (max 3 minutes)
+            start_time = time.time()
+            while is_recording and (time.time() - start_time) < 60:  # 3 minutes
+                try:
+                    # Listen for audio with a longer timeout
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=30)
+                    audio_chunks.append(audio)
+                    
+                except sr.WaitTimeoutError:
+                    # Continue if no audio detected
+                    continue
+                except Exception as e:
+                    print(f"Recording error: {repr(e)}")
+                    break
+            
+            # Stop recording
+            is_recording = False
+            
+            # Combine audio chunks
+            if audio_chunks:
+                # Combine audio chunks
+                combined_audio = audio_chunks[0]
+                for chunk in audio_chunks[1:]:
+                    combined_audio.get_wav_data().extend(chunk.get_wav_data())
+                
+                # Recognize the entire audio
+                try:
+                    text = recognizer.recognize_google(combined_audio, language="en-US")
+                    
+                    # Update on main thread
+                    def update_ui():
+                        if user_response_entry:
+                            # Set the text in the entry
+                            user_response_entry.delete(0, "end")
+                            user_response_entry.insert(0, text)
+                            
+                            # Add recognized text message
+                            result.insert("end", "\nRecognized Text:\n")
+                            result.insert("end", text + "\n")
+                            result.see("end")
+                        
+                        # Reset mic button color
+                        mic_button.configure(fg_color="#2B7DE9")
+                    
+                    # Call UI update on main thread
+                    root.after(0, update_ui)
+                
+                except sr.UnknownValueError:
+                    # No speech could be recognized
+                    root.after(0, lambda: result.insert("end", "\nCould not understand audio. No speech detected.\n"))
+                except sr.RequestError as e:
+                    # Could not request results from service
+                    root.after(0, lambda: result.insert("end", f"\nSpeech recognition service error: {repr(e)}\n"))
+                except Exception as e:
+                    # Catch any other unexpected errors
+                    root.after(0, lambda: result.insert("end", f"\nRecognition error: {repr(e)}\n"))
+            else:
+                # No audio chunks recorded
+                root.after(0, lambda: result.insert("end", "\nNo audio recorded.\n"))
+    
+    except Exception as e:
+        error_msg = f"Recording error details: {repr(e)}"
+        print(error_msg)
+        root.after(0, lambda: result.insert("end", f"\n{error_msg}\n"))
+    
+    # Ensure mic button is reset
+    root.after(0, lambda: mic_button.configure(fg_color="#2B7DE9"))
+    
+    print("Long-form recording thread ending")
+
 def simplified_recording():
     """Simplified speech recognition function with better error handling"""
     global is_recording, recognizer, user_response_entry, result
@@ -508,7 +606,7 @@ def generate_questions():
         result.insert("end", f"An error occurred: {str(e)}")
 
 def create_user_response_ui(question, career):
-    """Create a frame for user response with proper error handling and microphone button"""
+    """Create a frame for user response with improved feedback structure"""
     global root, result, user_response_entry, mic_button
     
     try:
@@ -570,34 +668,52 @@ def create_user_response_ui(question, career):
                 print("User Response: ", user_response_text)
                 
                 # Display the user response
-                result.insert("end", "\n" + "User: " + user_response_text + "\n")
+                result.insert("end", "\n" + "Your Response: " + user_response_text + "\n")
                 result.see("end")
                 
-                # Get feedback using the selected API
-                feedback = get_completion("", user_response_text)
-                print("Feedback: ", feedback)
+                # Prepare a comprehensive prompt for detailed feedback
+                comprehensive_prompt = f"""You are an expert interviewer providing a comprehensive evaluation of an interview response. 
+                Analyze the following response to the interview question: "{question}"
+
+                For the job position of {career}, provide a detailed assessment with three key sections:
+
+                1. Overall Rating and Feedback:
+                - Evaluate the response on a scale of 1-10
+                - Provide a quick summary of the response's strengths and weaknesses
+                - Assess how well the response addresses the original question
+
+                2. Detailed Analysis and Improvement Tips:
+                - Break down specific areas of improvement
+                - Suggest how to enhance the response
+                - Provide concrete examples of what could make the answer stronger
+                - Highlight any missing key elements or perspectives
+
+                3. Follow-up Question:
+                - Generate a targeted follow-up question that probes deeper into the topic
+                - The question should challenge the candidate to provide more insight or demonstrate deeper understanding
+
+                Response to evaluate: "{user_response_text}"
+                """
                 
-                # Display the feedback
-                result.insert("end", 'Feedback: ' + feedback + "\n\n")
+                # Get comprehensive feedback using the selected API
+                comprehensive_feedback = get_completion(comprehensive_prompt)
+                print("Comprehensive Feedback: ", comprehensive_feedback)
+                
+                # Display the comprehensive feedback
+                result.insert("end", comprehensive_feedback + "\n\n")
                 result.see("end")
+                
+                # Extract the follow-up question for the next round
+                # This is a simple extraction - in a real-world scenario, you might want a more robust method
+                new_question_match = re.search(r'3\. Follow-up Question:(.*?)(?=\n\n|\n[1-4]\.|\Z)', comprehensive_feedback, re.DOTALL)
+                new_question = new_question_match.group(1).strip() if new_question_match else "Tell me more about your previous response."
                 
                 # Clean up the response UI
                 user_response_frame.destroy()
                 
-                # Create a new prompt for the next question
-                new_prompt = feedback + "\nNew interview question for a " + career + " position:"
-                
-                # Get the next question
-                new_question = get_completion(new_prompt)
-                
-                if not new_question.startswith("Error:"):
-                    result.insert("end", f"> {new_question}\n")
-                    result.see("end")
-                    
-                    # Create UI for next response
-                    create_user_response_ui(new_question, career)
-                else:
-                    result.insert("end", new_question)
+                # Create UI for next response with the follow-up question
+                create_user_response_ui(new_question, career)
+            
             except Exception as e:
                 error_msg = f"Error processing response: {str(e)}\n\n{traceback.format_exc()}"
                 print(error_msg)
