@@ -1,4 +1,5 @@
 import os
+import sys
 import string
 from openai import OpenAI
 import customtkinter as ctk
@@ -12,6 +13,12 @@ import traceback
 import threading
 import re
 import time
+import app_settings
+
+# Add the directory containing app_settings.py to the Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
 # Initialize global variables
 client = None
@@ -190,10 +197,12 @@ def get_completion_via_requests(prompt, user_input=None):
         print(error_msg)  # Print to console for debugging
         return f"Sorry, there was an error communicating with the {api_type} API service. Please check your API key and internet connection.\n\nError details: {str(e)}"
 
+# Replace the current blink_recording_indicator function with this simplified version
 def blink_recording_indicator():
     """Create a reliable blinking 'Recording...' indicator in the result textbox"""
     global is_recording, recording_indicator_id, result, root, is_blinking
     
+    # Early exit if we're not recording or result box isn't available
     if not is_recording or not result:
         return
     
@@ -201,70 +210,86 @@ def blink_recording_indicator():
         # Toggle blinking state
         is_blinking = not is_blinking
         
-        # Clear previous text and insert new indicator
+        # Remove any previous indicator
         try:
             result.delete("recording_start", "recording_end")
         except:
             pass
             
-        # Use a different indicator based on blink state
-        indicator_text = "🔴 Recording 🔴" if is_blinking else "Recording..."
+        # Simple fixed indicator - no emoji that might cause issues
+        indicator_text = "RECORDING..." if is_blinking else "recording..."
         
-        # Insert at the end
-        result.insert("end", indicator_text)
-        result.mark_set("recording_start", "end-" + str(len(indicator_text)) + "c")
+        # Find the end of text
+        end_pos = result.index("end-1c")
+        
+        # Insert indicator at a fixed position instead of at the end
+        result.insert("end", "\n" + indicator_text)
+        result.mark_set("recording_start", "end-" + str(len(indicator_text) + 1) + "c")
         result.mark_set("recording_end", "end")
-        result.see("end")
         
-        # Force update the UI
+        # Force update but don't scroll - this prevents UI jumping
         root.update_idletasks()
         
-        # Schedule next blink
-        recording_indicator_id = root.after(500, blink_recording_indicator)
+        # Only schedule next blink if still recording
+        if is_recording:
+            recording_indicator_id = root.after(500, blink_recording_indicator)
             
     except Exception as e:
         print(f"Error in blinking indicator: {str(e)}")
+        # Don't reschedule if there was an error
 
 def toggle_recording():
-    """Toggle speech recording on/off with improved long-form recording"""
+    """Toggle speech recording on/off with improved error handling"""
     global is_recording, recognizer, mic_button, user_response_entry, result, recording_thread
     
     try:
-        # Toggle recording state
-        is_recording = not is_recording
-        
+        # First, check if we're already recording and need to stop
         if is_recording:
-            # Change button color to red to indicate recording
-            mic_button.configure(fg_color="#E53935")
-            
-            # Initialize recognizer if not already done
-            if not recognizer:
-                recognizer = sr.Recognizer()
-            
-            # Insert recording start message
-            result.insert("end", "\n🔴 Recording... (click mic again to stop)\n")
-            result.see("end")
-            
-            # Force UI update
-            root.update_idletasks()
-            
-            # Start recording in a separate thread
-            recording_thread = threading.Thread(target=long_form_recording, daemon=True)
-            recording_thread.start()
-        else:
-            # Stop recording
+            # Set flag to stop recording
             is_recording = False
-            mic_button.configure(fg_color="#2B7DE9")
             
-            # Wait for the recording thread to finish
-            if 'recording_thread' in globals() and recording_thread:
-                recording_thread.join()
+            # Change button color back to blue
+            if mic_button:
+                mic_button.configure(fg_color="#2B7DE9")
             
+            # Clear any recording indicators
+            try:
+                result.delete("recording_start", "recording_end")
+            except:
+                pass
+                
+            # Add status message
             result.insert("end", "\nStopped recording. Processing audio...\n")
             result.see("end")
             
-            # Force UI update
+            # Force UI update to show stopped state immediately
             root.update_idletasks()
+            
+            # No need to join thread here - we'll let it finish processing naturally
+            return
+            
+        # If we get here, we're starting a new recording
+        is_recording = True
+        
+        # Change button color to red to indicate recording
+        if mic_button:
+            mic_button.configure(fg_color="#E53935")
+        
+        # Initialize recognizer if not already done
+        if not recognizer:
+            recognizer = sr.Recognizer()
+        
+        # Insert recording start message - simplified to avoid issues
+        result.insert("end", "\n🔴 Recording... (click mic again to stop)\n")
+        result.see("end")
+        
+        # Force UI update before starting thread
+        root.update_idletasks()
+        
+        # Start recording in a separate thread
+        recording_thread = threading.Thread(target=improved_recording, daemon=True)
+        recording_thread.start()
+        
     except Exception as e:
         print(f"Toggle recording error details: {repr(e)}")
         result.insert("end", f"\nError toggling recording: {repr(e)}\n")
@@ -275,8 +300,119 @@ def toggle_recording():
         if mic_button:
             mic_button.configure(fg_color="#2B7DE9")
 
+def improved_recording():
+    """Improved recording method with better error handling"""
+    global is_recording, recognizer, user_response_entry, result
+    
+    try:
+        # Use the microphone as source
+        with sr.Microphone() as source:
+            print("Microphone initialized")
+            
+            # Adjust for ambient noise
+            recognizer.adjust_for_ambient_noise(source, duration=0.3)
+            print("Ambient noise adjusted")
+            
+            # Build up the full text as we go
+            full_text = ""
+            
+            # Configure recognizer for better performance
+            recognizer.pause_threshold = 0.8
+            recognizer.dynamic_energy_threshold = True
+            recognizer.energy_threshold = 150
+            
+            # Record until stopped or timeout (max 3 minutes)
+            start_time = time.time()
+            
+            while is_recording and (time.time() - start_time) < 180:
+                try:
+                    # Process audio in smaller chunks
+                    print("Listening...")
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                    
+                    # Try to recognize speech in this chunk
+                    try:
+                        text = recognizer.recognize_google(audio, language="en-US")
+                        if text and text.strip():
+                            print(f"Recognized: {text}")
+                            
+                            # Append to our full text
+                            if full_text:
+                                full_text += " " + text
+                            else:
+                                full_text = text
+                            
+                            # Update the UI with progress
+                            def update_ui():
+                                if user_response_entry:
+                                    # Set the text in the entry
+                                    user_response_entry.delete(0, "end")
+                                    user_response_entry.insert(0, full_text)
+                            
+                            # Call UI update on main thread
+                            if root:
+                                root.after(0, update_ui)
+                    
+                    except sr.UnknownValueError:
+                        # No recognizable speech in this chunk
+                        print("No speech detected in segment")
+                        pass
+                    except Exception as e:
+                        print(f"Recognition error: {repr(e)}")
+                
+                except sr.WaitTimeoutError:
+                    # No audio detected, continue loop
+                    print("No audio detected, continuing")
+                    pass
+                except Exception as e:
+                    print(f"Listening error: {repr(e)}")
+                    break
+                
+                # Check if recording has been stopped
+                if not is_recording:
+                    print("Recording flag set to stop")
+                    break
+                
+                # Periodically update UI to stay responsive
+                if root:
+                    root.after(0, root.update_idletasks)
+            
+            # Recording complete
+            print("Recording complete, final text:", full_text)
+            
+            # Final update to the UI with the complete text
+            if full_text:
+                def final_update():
+                    if user_response_entry:
+                        user_response_entry.delete(0, "end")
+                        user_response_entry.insert(0, full_text)
+                        
+                        # Update result area
+                        result.insert("end", "\nRecording complete.\n")
+                        result.see("end")
+                
+                if root:
+                    root.after(0, final_update)
+            else:
+                if root and result:
+                    root.after(0, lambda: result.insert("end", "\nNo speech was recognized.\n"))
+                    root.after(0, lambda: result.see("end"))
+            
+    except Exception as e:
+        print(f"Recording error details: {repr(e)}")
+        if root and result:
+            root.after(0, lambda: result.insert("end", f"\nRecording error: {repr(e)}\n"))
+            root.after(0, lambda: result.see("end"))
+    
+    # Always make sure the recording state is reset
+    is_recording = False
+    if root and mic_button:
+        root.after(0, lambda: mic_button.configure(fg_color="#2B7DE9"))
+    
+    print("Recording thread completed")
+
 def long_form_recording():
-    """Record audio continuously for up to 3 minutes or until stopped"""
+    """Record audio continuously for up to 3 minutes or until stopped with improved handling"""
     global is_recording, recognizer, user_response_entry, result
     
     try:
@@ -292,17 +428,53 @@ def long_form_recording():
             audio_chunks = []
             
             # Configure recognizer for long-form recording
-            recognizer.pause_threshold = 0.5
+            recognizer.pause_threshold = 0.8  # Increased to allow for natural pauses
             recognizer.dynamic_energy_threshold = True
             recognizer.energy_threshold = 100
             
+            # Start blinking recording indicator
+            if root and result:
+                root.after(0, blink_recording_indicator)
+            
             # Record until stopped (max 3 minutes)
             start_time = time.time()
-            while is_recording and (time.time() - start_time) < 60:  # 3 minutes
+            while is_recording and (time.time() - start_time) < 180:  # 3 minutes (changed from 60 seconds)
                 try:
-                    # Listen for audio with a longer timeout
-                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=30)
+                    # Listen for audio with a more reasonable timeout
+                    # Break audio into smaller chunks with shorter phrase_time_limit
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
                     audio_chunks.append(audio)
+                    
+                    # Process each chunk immediately to avoid UI freezing
+                    try:
+                        # Try to recognize this chunk
+                        partial_text = recognizer.recognize_google(audio, language="en-US")
+                        
+                        # Update UI with partial recognition for feedback
+                        def update_partial():
+                            if user_response_entry and partial_text:
+                                current_text = user_response_entry.get()
+                                if current_text:
+                                    # Append the new text with a space
+                                    user_response_entry.delete(0, "end")
+                                    user_response_entry.insert(0, current_text + " " + partial_text)
+                                else:
+                                    # Set the new text
+                                    user_response_entry.delete(0, "end")
+                                    user_response_entry.insert(0, partial_text)
+                                
+                                # Add recognized text message but with less UI clutter
+                                # result.insert("end", f"\nPartial: {partial_text}")
+                                # result.see("end")
+                        
+                        # Update UI on main thread
+                        root.after(0, update_partial)
+                    except sr.UnknownValueError:
+                        # No speech detected in this chunk, just continue
+                        pass
+                    except Exception as e:
+                        # Log errors but continue recording
+                        print(f"Partial recognition error: {repr(e)}")
                     
                 except sr.WaitTimeoutError:
                     # Continue if no audio detected
@@ -310,31 +482,51 @@ def long_form_recording():
                 except Exception as e:
                     print(f"Recording error: {repr(e)}")
                     break
+                
+                # Force UI update to keep app responsive
+                if root:
+                    root.after(0, root.update_idletasks)
             
             # Stop recording
             is_recording = False
             
-            # Combine audio chunks
+            # Combine and process the full recording only when complete
             if audio_chunks:
-                # Combine audio chunks
-                combined_audio = audio_chunks[0]
-                for chunk in audio_chunks[1:]:
-                    combined_audio.get_wav_data().extend(chunk.get_wav_data())
+                # Update UI
+                root.after(0, lambda: result.insert("end", "\nProcessing full recording...\n"))
+                root.after(0, lambda: result.see("end"))
+                root.after(0, root.update_idletasks)
                 
-                # Recognize the entire audio
-                try:
-                    text = recognizer.recognize_google(combined_audio, language="en-US")
-                    
-                    # Update on main thread
+                # Build complete text from all recognized chunks
+                full_text = ""
+                
+                # Process each chunk individually rather than combining audio data
+                for i, chunk in enumerate(audio_chunks):
+                    try:
+                        # Process in smaller batches to avoid UI freezes
+                        if i % 3 == 0 and root:
+                            root.update_idletasks()
+                            
+                        chunk_text = recognizer.recognize_google(chunk, language="en-US")
+                        if chunk_text:
+                            full_text += " " + chunk_text
+                    except sr.UnknownValueError:
+                        # Skip chunks with no recognizable speech
+                        pass
+                    except Exception as e:
+                        print(f"Error processing chunk {i}: {repr(e)}")
+                
+                # Update on main thread with the full text
+                if full_text:
                     def update_ui():
                         if user_response_entry:
                             # Set the text in the entry
                             user_response_entry.delete(0, "end")
-                            user_response_entry.insert(0, text)
+                            user_response_entry.insert(0, full_text.strip())
                             
                             # Add recognized text message
-                            result.insert("end", "\nRecognized Text:\n")
-                            result.insert("end", text + "\n")
+                            result.insert("end", "\nFull Recording Processed:\n")
+                            result.insert("end", full_text.strip() + "\n")
                             result.see("end")
                         
                         # Reset mic button color
@@ -342,16 +534,8 @@ def long_form_recording():
                     
                     # Call UI update on main thread
                     root.after(0, update_ui)
-                
-                except sr.UnknownValueError:
-                    # No speech could be recognized
-                    root.after(0, lambda: result.insert("end", "\nCould not understand audio. No speech detected.\n"))
-                except sr.RequestError as e:
-                    # Could not request results from service
-                    root.after(0, lambda: result.insert("end", f"\nSpeech recognition service error: {repr(e)}\n"))
-                except Exception as e:
-                    # Catch any other unexpected errors
-                    root.after(0, lambda: result.insert("end", f"\nRecognition error: {repr(e)}\n"))
+                else:
+                    root.after(0, lambda: result.insert("end", "\nNo speech was recognized in the recording.\n"))
             else:
                 # No audio chunks recorded
                 root.after(0, lambda: result.insert("end", "\nNo audio recorded.\n"))
@@ -359,10 +543,13 @@ def long_form_recording():
     except Exception as e:
         error_msg = f"Recording error details: {repr(e)}"
         print(error_msg)
-        root.after(0, lambda: result.insert("end", f"\n{error_msg}\n"))
+        if root and result:
+            root.after(0, lambda: result.insert("end", f"\n{error_msg}\n"))
+            root.after(0, lambda: result.see("end"))
     
     # Ensure mic button is reset
-    root.after(0, lambda: mic_button.configure(fg_color="#2B7DE9"))
+    if root and mic_button:
+        root.after(0, lambda: mic_button.configure(fg_color="#2B7DE9"))
     
     print("Long-form recording thread ending")
 
@@ -652,8 +839,11 @@ def create_user_response_ui(question, career):
                     
                     # Cancel blinking indicator if active
                     if recording_indicator_id:
-                        root.after_cancel(recording_indicator_id)
-                        recording_indicator_id = None
+                        try:
+                            root.after_cancel(recording_indicator_id)
+                            recording_indicator_id = None
+                        except:
+                            pass
                         
                     # Remove recording indicator tag
                     try:
@@ -661,10 +851,17 @@ def create_user_response_ui(question, career):
                     except:
                         pass  # Ignore if tags don't exist
                 
+                # Get the response text
+                user_response_text = user_response_entry.get().strip()
+                if not user_response_text:
+                    result.insert("end", "\nPlease enter a response before sending.\n")
+                    result.see("end")
+                    return
+                    
+                # Continue with sending the response as before...
                 send_button_var.set(True)
                 send_button.configure(fg_color=("green", "gray35"))
                 
-                user_response_text = user_response_entry.get()
                 print("User Response: ", user_response_text)
                 
                 # Display the user response
